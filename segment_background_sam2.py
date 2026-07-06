@@ -4,12 +4,13 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from typing import Optional, Tuple, List
+import time
 
 # --- ACTUAL SAM 1.0/SAM 2.0 (Segment Anything) IMPORTS ---
 # NOTE: The provided example uses SAM 1.0 (segment_anything library).
-# We are adapting the class to use these imports directly.
-from segment_anything import sam_model_registry, SamPredictor
-# --------------------------------------------------------
+# We are adapting the class to use SAM2.
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 class SAMSegmentor:
     """
@@ -18,33 +19,41 @@ class SAMSegmentor:
     """
     
     # --- Configuration Defaults (Updated for SAM 1.0 logic) ---
-    DEFAULT_MODEL_TYPE = "vit_l"
-    DEFAULT_CHECKPOINT = "./models/sam_vit_l_0b3195.pth"
+    _BASE_DIR = os.path.dirname(__file__)
+    """
+    DEFAULT_MODEL_TYPE = "hiera_b+"
+    DEFAULT_CHECKPOINT = os.path.join(_BASE_DIR, "checkpoints/sam2.1_hiera_base_plus.pt")
+    DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+    """
+    DEFAULT_MODEL_TYPE = "hiera_t"
+    DEFAULT_CHECKPOINT = os.path.join(_BASE_DIR, "checkpoints/sam2.1_hiera_tiny.pt")
+    DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
     
     def __init__(
         self, 
         model_type: str = DEFAULT_MODEL_TYPE, 
         checkpoint_path: str = DEFAULT_CHECKPOINT,
+        model_cfg_path: str = DEFAULT_MODEL_CFG,
         device: Optional[str] = None
     ):
         """
         Initializes the SAMSegmentor.
         
         Args:
-            model_type (str): The SAM model variant ('vit_h', 'vit_l', 'vit_b').
             checkpoint_path (str): Path to the model checkpoint (.pth file).
             device (Optional[str]): PyTorch device ('cuda' or 'cpu'). Defaults 
                                     to 'cuda' if available, otherwise 'cpu'.
         """
         self.model_type = model_type
         self.checkpoint_path = checkpoint_path
+        self.model_cfg_path = model_cfg_path
         
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
-            
-        self.predictor: Optional[SamPredictor] = None
+        
+        self.predictor: Optional[SAM2ImagePredictor] = None
         
         print(f"SAMSegmentor initialized. Device: {self.device}")
 
@@ -111,13 +120,13 @@ class SAMSegmentor:
             return
 
         print(f"Loading SAM model ({self.model_type}) from {self.checkpoint_path}...")
-        
-        # 1. Load the model
-        sam = sam_model_registry[self.model_type](checkpoint=self.checkpoint_path)
-        sam.to(device=self.device)
-        
-        # 2. Create the predictor
-        self.predictor = SamPredictor(sam)
+
+        # 1. Build the SAM2 model
+        sam_model = build_sam2(self.model_cfg_path, self.checkpoint_path)
+        sam_model.to(device=self.device)
+
+        # 2. Create the SAM2 predictor
+        self.predictor = SAM2ImagePredictor(sam_model)
         print("Model loaded successfully.")
 
     def _post_process_mask(self, masks: np.ndarray, scores: np.ndarray, H: int, W: int) -> np.ndarray:
@@ -168,7 +177,6 @@ class SAMSegmentor:
         if image_bgr is None:
             print(f"Error: cannot read image {input_path}")
             return
-
         # SAM expects images in RGB format
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         H, W, _ = image_bgr.shape
@@ -177,21 +185,20 @@ class SAMSegmentor:
         image_rgb_filtered = cv2.medianBlur(image_rgb, 3)
 
         # --- Run SAM predictor ---
-        print("Processing image embeddings...")
-        self.predictor.set_image(image_rgb_filtered)
-        
-        # Prompting with the full bounding box, minus a 1-pixel border (as in your example)
-        input_box = np.array([0, 0, W-0, H-0])
-        print(f"Using bounding box prompt: {input_box}")
-        
-        print("Running prediction...")
-        masks, scores, logits = self.predictor.predict(
-            point_coords=None,
-            point_labels=None,
-            box=input_box[None, :],
-            multimask_output=True,
-        )
-        
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            print("Processing image embeddings...")
+            self.predictor.set_image(image_rgb_filtered)
+
+            # Prompting with the full bounding box
+            input_box = np.array([0, 0, W, H])
+            print(f"Using bounding box prompt: {input_box}")
+
+            print("Running prediction...")
+            masks, scores, logits = self.predictor.predict(
+                box=input_box,
+                multimask_output=True,
+            )
+
         if len(masks) == 0:
             print("No masks returned.")
             return
@@ -248,8 +255,15 @@ if __name__ == "__main__":
     
     # IMPORTANT: Update these paths to match your local setup!
     # 'vit_l' is medium (approx. 1.25 GB).
-    MODEL_TYPE = "vit_l" 
-    CHECKPOINT = "./models/sam_vit_l_0b3195.pth"
+    _BASE_DIR = os.path.dirname(__file__)
+    """
+    DEFAULT_MODEL_TYPE = "hiera_b+"
+    DEFAULT_CHECKPOINT = os.path.join(_BASE_DIR, "checkpoints/sam2.1_hiera_base_plus.pt")
+    DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+    """
+    DEFAULT_MODEL_TYPE = "hiera_t"
+    DEFAULT_CHECKPOINT = os.path.join(_BASE_DIR, "checkpoints/sam2.1_hiera_tiny.pt")
+    DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
     # ----------------------------
 
     # Create a mock image file for testing the logic if it doesn't exist
@@ -270,7 +284,8 @@ if __name__ == "__main__":
     try:
         segmentor = SAMSegmentor(
             model_type=MODEL_TYPE,
-            checkpoint_path=CHECKPOINT
+            checkpoint_path=CHECKPOINT,
+            model_cfg_path=MODEL_CFG
         )
         # Process the single image with debug saving
         segmentor.segment_image(
